@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dino Run with Laya</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; justify-content: center;
+    font-family: "SF Mono", Menlo, Consolas, monospace; background: #f7f7f7; color: #535353;
+  }
+  main { padding: 24px 16px; width: 640px; max-width: 100%; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  #game {
+    display: block; width: 600px; max-width: 100%; height: auto;
+    background: #fff; border: 1px solid #d9d9d9; border-radius: 6px;
+  }
+  .controls {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin: 10px 0 4px; font-size: 13px;
+  }
+  .controls label { display: flex; align-items: center; gap: 6px; }
+  select, button { font: inherit; }
+  .source { font-weight: bold; }
+  .latency { color: #777; }
+  details {
+    margin-top: 10px; background: #fff; border: 1px solid #d9d9d9;
+    border-radius: 6px; padding: 8px 12px; font-size: 12px;
+  }
+  details summary { cursor: pointer; font-weight: bold; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-top: 8px; }
+  .grid h3 { margin: 4px 0; font-size: 12px; }
+  .grid .wide { grid-column: 1 / 3; }
+  pre {
+    margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 180px;
+    overflow: auto; background: #f2f2f2; border-radius: 4px; padding: 6px 8px;
+  }
+  .err { color: #b3261e; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🦖 Dino Run with Laya</h1>
+  <canvas id="game" width="600" height="150"></canvas>
+  <div class="controls">
+    <label>Mode
+      <select id="mode">
+        <option value="human" selected>Human</option>
+        <option value="ai">AI</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="assist"> Local timing assist</label>
+    <span>source: <span id="source" class="source">idle</span></span>
+    <span id="latency" class="latency"></span>
+  </div>
+  <details id="debugPanel">
+    <summary>AI debug panel</summary>
+    <div class="grid">
+      <div><h3>Decision status</h3><pre id="dbgStatus">idle</pre></div>
+      <div><h3>Latency</h3><pre id="dbgLatency">—</pre></div>
+      <div class="wide"><h3>Latest snapshot (request)</h3><pre id="dbgSnapshot">—</pre></div>
+      <div class="wide"><h3>Latest response</h3><pre id="dbgResponse">—</pre></div>
+      <div class="wide"><h3>Applied action</h3><pre id="dbgApplied">—</pre></div>
+      <div class="wide"><h3>Decision history (last 5)</h3><pre id="dbgHistory">—</pre></div>
+    </div>
+  </details>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Constants (backend counterparts in main.py must stay in sync)
+// ---------------------------------------------------------------------------
+const W = 600, H = 150;
+const GROUND_Y = 128;
+const JUMP_VELOCITY = -600;      // px/s
+const GRAVITY = 2160;            // px/s^2
+const DINO_X = 44;
+const DINO_STAND_W = 44, DINO_STAND_H = 47;
+const DINO_DUCK_W = 59, DINO_DUCK_H = 25;
+const HITBOX_INSET = 6;
+const BASE_SPEED = 240, MAX_SPEED = 780;   // px/s
+const RAMP_SECONDS = 120, SPEED_STEPS = 48;
+const SCORE_PER_PIXEL = 0.05;
+const INITIAL_SPAWN_DELAY = 520; // px
+const HIGH_SCORE_KEY = "dino-run-high-score";
+
+const AI_LOOKAHEAD_DISTANCE = 650; // px
+const AI_EMPTY_POLL_MS = 300;
+const AI_JUMP_LEAD_SECONDS = 0.30; // must match JUMP_LEAD_SECONDS in main.py
+const AI_DUCK_LEAD_SECONDS = 0.35; // must match DUCK_LEAD_SECONDS in main.py
+const JUMP_LATE_PIXELS = 12;       // must match JUMP_LATE_PIXELS in main.py
+
+// ---------------------------------------------------------------------------
+// Canvas setup (devicePixelRatio-aware)
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+function setupCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+setupCanvas();
+window.addEventListener("resize", setupCanvas);
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
+const game = {
+  mode: "start",            // "start" | "playing" | "over"
+  speed: BASE_SPEED,
+  score: 0,
+  playTime: 0,
+  distanceToSpawn: INITIAL_SPAWN_DELAY,
+  obstacles: [],
+  runFrame: 0,
+  overAt: 0,
+};
+
+const dino = {
+  x: DINO_X,
+  y: GROUND_Y - DINO_STAND_H,
+  vy: 0,
+  grounded: true,
+  ducking: false,
+};
+
+let highScore = 0;
+try { highScore = Number(localStorage.getItem(HIGH_SCORE_KEY)) || 0; } catch (e) { /* storage unavailable */ }
+
+function dinoW() { return dino.ducking ? DINO_DUCK_W : DINO_STAND_W; }
+function dinoH() { return dino.ducking ? DINO_DUCK_H : DINO_STAND_H; }
+// dino.y is the top of the standing box; the shorter duck box must stay anchored to the ground.
+function dinoBoxY() { return dino.ducking ? dino.y + (DINO_STAND_H - DINO_DUCK_H) : dino.y; }
+
+function speedProgress() { return Math.min(1, game.playTime / RAMP_SECONDS); }
+
+function currentSpeed() {
+  // Ramp via SPEED_STEPS small bumps (~11.25 px/s each) instead of spikes.
+  const step = (MAX_SPEED - BASE_SPEED) / SPEED_STEPS;
+  const steps = Math.min(SPEED_STEPS, Math.floor(game.playTime / (RAMP_SECONDS / SPEED_STEPS)));
+  return BASE_SPEED + steps * step;
+}
+
+// ---------------------------------------------------------------------------
+// Obstacles
+// ---------------------------------------------------------------------------
+const CACTUS_PRESETS = [
+  { w: 17, h: 35 }, { w: 25, h: 45 }, { w: 34, h: 35 }, { w: 42, h: 30 },
+];
+const BIRD_HEIGHTS = [
+  { variant: "jump", y: 96, h: 24 },  // low — must jump
+  { variant: "duck", y: 76, h: 22 },  // head-height — must duck
+  { variant: "high", y: 40, h: 22 },  // high — ignore
+];
+
+function spawnObstacle() {
+  if (Math.random() < 0.55) {
+    const p = CACTUS_PRESETS[Math.floor(Math.random() * CACTUS_PRESETS.length)];
+    game.obstacles.push({ kind: "cactus", variant: "single", x: W + 10, y: GROUND_Y - p.h, w: p.w, h: p.h });
+  } else {
+    const b = BIRD_HEIGHTS[Math.floor(Math.random() * BIRD_HEIGHTS.length)];
+    game.obstacles.push({ kind: "bird", variant: b.variant, x: W + 10, y: b.y, w: 46, h: b.h });
+  }
+  const t = speedProgress();
+  const minExtra = 180 - 90 * t;    // 180 → 90 px
+  const randomGap = 340 - 180 * t;  // 340 → 180 px
+  game.distanceToSpawn = minExtra + Math.random() * randomGap;
+}
+
+// ---------------------------------------------------------------------------
+// AI state
+// ---------------------------------------------------------------------------
+const AI = {
+  busy: false,
+  requestId: 0,
+  lastRequestAt: 0,
+  latencies: [],        // last 5 round-trip times (ms)
+  pending: null,        // decision awaiting application in the game loop
+  duckHold: false,
+  source: "idle",       // "Laya" | "local timing enabled" | "idle"
+  status: "idle",
+  lastError: "",
+  lastSnapshot: null,
+  lastResponse: null,
+  history: [],          // last 5 applied decisions
+  lastLocalAction: "",
+};
+
+const modeSelect = document.getElementById("mode");
+const assistBox = document.getElementById("assist");
+const sourceEl = document.getElementById("source");
+const latencyEl = document.getElementById("latency");
+
+function avgLatency() {
+  if (!AI.latencies.length) return 0;
+  return AI.latencies.reduce((a, b) => a + b, 0) / AI.latencies.length;
+}
+
+function requiredAction(o) {
+  if (o.kind === "cactus") return "jump";
+  if (o.variant === "duck") return "duck";
+  if (o.variant === "jump") return "jump";
+  return "ignore";
+}
+
+function upcomingObstacles(maxCount) {
+  const front = dino.x + dinoW();
+  return game.obstacles
+    .filter((o) => o.x + o.w > front - 4) // not already behind the dino
+    .sort((a, b) => a.x - b.x)
+    .slice(0, maxCount);
+}
+
+function buildSnapshot() {
+  const front = dino.x + dinoW();
+  return {
+    grounded: dino.grounded,
+    ducking: dino.ducking,
+    speed: Math.round(game.speed * 10) / 10,
+    score: Math.round(game.score * 10) / 10,
+    decision_latency_ms: Math.round(avgLatency()),
+    obstacles: upcomingObstacles(2).map((o) => ({
+      kind: o.kind,
+      variant: o.variant,
+      x: Math.round((o.x - front) * 10) / 10, // relative to the dino's front edge
+      y: o.y,
+      w: o.w,
+      h: o.h,
+    })),
+  };
+}
+
+function maybePoll(nowMs) {
+  if (modeSelect.value !== "ai" || assistBox.checked) return;
+  if (AI.busy) return;
+  const next = upcomingObstacles(1)[0];
+  const relX = next ? next.x - (dino.x + dinoW()) : Infinity;
+  if (relX >= AI_LOOKAHEAD_DISTANCE && nowMs - AI.lastRequestAt < AI_EMPTY_POLL_MS) return;
+  sendRequest();
+}
+
+async function sendRequest() {
+  const snapshot = buildSnapshot();
+  const id = ++AI.requestId;
+  AI.busy = true;
+  AI.lastRequestAt = performance.now();
+  AI.status = "awaiting response…";
+  AI.lastSnapshot = snapshot;
+  updateDebug();
+  const t0 = performance.now();
+  try {
+    const res = await fetch("/dino/act", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(snapshot),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const rtt = performance.now() - t0;
+    if (id !== AI.requestId) return; // stale response
+    AI.latencies.push(rtt);
+    if (AI.latencies.length > 5) AI.latencies.shift();
+    AI.lastResponse = data;
+    AI.lastError = "";
+    AI.status = "decision received";
+    // Do NOT apply here — stage it; the game loop applies it.
+    AI.pending = {
+      action: data.action,
+      source: "Laya",
+      reason: data.debug && data.debug.reason ? data.debug.reason : "",
+      groundedAtRequest: snapshot.grounded,
+    };
+  } catch (err) {
+    if (id !== AI.requestId) return;
+    AI.lastError = String(err);
+    AI.status = "error";
+    AI.pending = {
+      action: "run",
+      source: "Laya",
+      reason: "Request failed, falling back to run: " + err,
+      groundedAtRequest: snapshot.grounded,
+    };
+  } finally {
+    AI.busy = false;
+    updateDebug();
+  }
+}
+
+function nearestThreatNeedsDuck() {
+  for (const o of upcomingObstacles(2)) {
+    const need = requiredAction(o);
+    if (need === "ignore") continue;
+    return need === "duck";
+  }
+  return false;
+}
+
+function localDecision() {
+  const front = dino.x + dinoW();
+  for (const o of upcomingObstacles(2)) {
+    const need = requiredAction(o);
+    if (need === "ignore") continue;
+    const relX = o.x - front;
+    if (need === "jump") {
+      if (relX <= game.speed * AI_JUMP_LEAD_SECONDS && relX > -JUMP_LATE_PIXELS) {
+        return { action: "jump", reason: "Local timing: cactus/low bird inside jump lead window." };
+      }
+    } else {
+      if (relX <= game.speed * AI_DUCK_LEAD_SECONDS) {
+        return { action: "duck", reason: "Local timing: head-height bird inside duck lead window." };
+      }
+    }
+    break; // only the first non-ignorable obstacle matters
+  }
+  return { action: "run", reason: "Local timing: nothing to react to yet." };
+}
+
+function recordDecision(applied) {
+  AI.source = applied.source;
+  AI.history.unshift({
+    time: new Date().toLocaleTimeString(),
+    action: applied.action,
+    source: applied.source,
+    reason: applied.reason,
+  });
+  if (AI.history.length > 5) AI.history.length = 5;
+}
+
+function applyPending() {
+  if (!AI.pending) return;
+  const p = AI.pending;
+  AI.pending = null;
+  AI.duckHold = false;
+  const applied = { action: p.action, source: p.source, reason: p.reason };
+  if (p.action === "jump") {
+    if (dino.grounded) {
+      doJump();
+    } else {
+      applied.action = "run";
+      applied.reason = p.groundedAtRequest
+        ? "Jump downgraded to run: the dino was grounded at request time but is airborne now that the response arrived."
+        : "Jump downgraded to run: the dino was already airborne at request time.";
+    }
+  } else if (p.action === "duck") {
+    if (nearestThreatNeedsDuck()) {
+      AI.duckHold = true;
+    } else {
+      applied.action = "run";
+      applied.reason = "Duck ignored: no head-height bird is the nearest threat.";
+    }
+  }
+  recordDecision(applied);
+  updateDebug();
+}
+
+function applyLocalAssist() {
+  const d = localDecision();
+  if (d.action !== AI.lastLocalAction) {
+    AI.lastLocalAction = d.action;
+    recordDecision({ action: d.action, source: "local timing enabled", reason: d.reason });
+    updateDebug();
+  }
+  AI.source = "local timing enabled";
+  if (d.action === "jump" && dino.grounded) doJump();
+  AI.duckHold = d.action === "duck";
+}
+
+// ---------------------------------------------------------------------------
+// Dino actions
+// ---------------------------------------------------------------------------
+function doJump() {
+  if (!dino.grounded) return;
+  dino.vy = JUMP_VELOCITY;
+  dino.grounded = false;
+  dino.ducking = false;
+}
+
+// ---------------------------------------------------------------------------
+// Update loop
+// ---------------------------------------------------------------------------
+let duckHeld = false;
+
+function update(dt, nowMs) {
+  game.playTime += dt;
+  game.speed = currentSpeed();
+  game.score += game.speed * dt * SCORE_PER_PIXEL;
+
+  // Dino physics
+  if (!dino.grounded) {
+    dino.vy += GRAVITY * dt;
+    dino.y += dino.vy * dt;
+    const floorY = GROUND_Y - DINO_STAND_H;
+    if (dino.y >= floorY) {
+      dino.y = floorY;
+      dino.vy = 0;
+      dino.grounded = true;
+    }
+  }
+  dino.ducking = dino.grounded && (duckHeld || AI.duckHold);
+  if (AI.duckHold && !nearestThreatNeedsDuck()) AI.duckHold = false; // never keep crouched without the threat
+
+  // Obstacles
+  for (const o of game.obstacles) o.x -= game.speed * dt;
+  game.obstacles = game.obstacles.filter((o) => o.x + o.w > -20);
+  game.distanceToSpawn -= game.speed * dt;
+  if (game.distanceToSpawn <= 0) spawnObstacle();
+
+  // Run animation frame
+  game.runFrame = Math.floor(game.playTime * 10) % 2;
+
+  // AI decisions
+  if (modeSelect.value === "ai") {
+    if (assistBox.checked) applyLocalAssist();
+    else applyPending();
+    maybePoll(nowMs);
+  }
+
+  // Collision (dino hitbox shrunk by HITBOX_INSET vs. the visible sprite)
+  const hx = dino.x + HITBOX_INSET, hy = dinoBoxY() + HITBOX_INSET;
+  const hw = dinoW() - 2 * HITBOX_INSET, hh = dinoH() - 2 * HITBOX_INSET;
+  for (const o of game.obstacles) {
+    if (hx < o.x + o.w && hx + hw > o.x && hy < o.y + o.h && hy + hh > o.y) {
+      gameOver();
+      return;
+    }
+  }
+}
+
+function gameOver() {
+  game.mode = "over";
+  game.overAt = performance.now();
+  AI.pending = null;
+  AI.duckHold = false;
+  const s = Math.floor(game.score);
+  if (s > highScore) {
+    highScore = s;
+    try { localStorage.setItem(HIGH_SCORE_KEY, String(highScore)); } catch (e) { /* ignore */ }
+  }
+}
+
+function resetGame() {
+  game.mode = "playing";
+  game.speed = BASE_SPEED;
+  game.score = 0;
+  game.playTime = 0;
+  game.distanceToSpawn = INITIAL_SPAWN_DELAY;
+  game.obstacles = [];
+  dino.y = GROUND_Y - DINO_STAND_H;
+  dino.vy = 0;
+  dino.grounded = true;
+  dino.ducking = false;
+  AI.pending = null;
+  AI.duckHold = false;
+  AI.source = "idle";
+  AI.status = "idle";
+  AI.lastError = "";
+  AI.lastLocalAction = "";
+  updateDebug();
+}
+
+// ---------------------------------------------------------------------------
+// Drawing (pixel-art-style sprites)
+// ---------------------------------------------------------------------------
+const INK = "#535353";
+const INK_DARK = "#3d3d3d";
+const INK_LIGHT = "#8f8f8f";
+const CACTUS_GREEN = "#2f7d32";
+const CACTUS_DARK = "#1e5a23";
+const CACTUS_LIGHT = "#54a458";
+
+function drawDino() {
+  const x = dino.x, y = dinoBoxY();
+  const p = (dx, dy, w, h) => ctx.fillRect(x + dx, y + dy, w, h);
+
+  if (dino.ducking) {
+    // 59×25 low profile: long body, blocky head with open-mouth notch
+    ctx.fillStyle = INK;
+    p(-8, 8, 6, 5);        // tail tip
+    p(-3, 10, 8, 8);       // tail
+    p(4, 8, 34, 12);       // body
+    p(38, 4, 16, 8);       // head top
+    p(38, 12, 10, 4);      // head, jaw side
+    p(48, 14, 6, 2);       // lower jaw tip (mouth notch above)
+    ctx.fillStyle = INK_LIGHT;
+    p(10, 14, 18, 4);      // belly
+    ctx.fillStyle = "#fff";
+    p(48, 6, 4, 4);        // eye
+    ctx.fillStyle = INK_DARK;
+    p(49, 7, 2, 2);        // pupil
+    ctx.fillStyle = INK;
+    if (game.runFrame === 0) {
+      p(12, 20, 3, 3); p(12, 23, 7, 2);   // leg down + foot
+      p(24, 20, 3, 2); p(24, 21, 7, 2);   // leg raised
+    } else {
+      p(24, 20, 3, 3); p(24, 23, 7, 2);
+      p(12, 20, 3, 2); p(12, 21, 7, 2);
+    }
+  } else {
+    // 44×47 standing / running / jumping: blocky head, thin stubby legs
+    ctx.fillStyle = INK;
+    p(-8, 14, 6, 4);       // tail tip
+    p(-4, 16, 10, 8);      // tail
+    p(6, 16, 18, 14);      // torso
+    p(10, 14, 12, 2);      // shoulders
+    p(20, 12, 8, 6);       // neck
+    p(22, 2, 20, 8);       // head top
+    p(22, 10, 12, 4);      // head, jaw side
+    p(34, 12, 8, 2);       // lower jaw tip (mouth notch above)
+    ctx.fillStyle = INK_DARK;
+    p(6, 16, 18, 2);       // back shading
+    ctx.fillStyle = INK_LIGHT;
+    p(10, 22, 12, 6);      // belly
+    ctx.fillStyle = "#fff";
+    p(34, 4, 4, 4);        // eye
+    ctx.fillStyle = INK_DARK;
+    p(35, 5, 2, 2);        // pupil
+    ctx.fillStyle = INK;
+    p(20, 24, 6, 3);       // arm
+    p(24, 27, 2, 2);       // hand
+    if (!dino.grounded) {
+      p(12, 30, 3, 9); p(12, 37, 7, 3);   // legs tucked (jump)
+      p(22, 30, 3, 9); p(22, 37, 7, 3);
+    } else if (game.runFrame === 0) {
+      p(12, 30, 3, 14); p(12, 44, 8, 3);  // back leg down + foot
+      p(22, 30, 3, 7); p(22, 36, 7, 3);   // front leg raised
+    } else {
+      p(22, 30, 3, 14); p(22, 44, 8, 3);
+      p(12, 30, 3, 7); p(12, 36, 7, 3);
+    }
+  }
+}
+
+function drawObstacle(o) {
+  if (o.kind === "cactus") {
+    const tx = Math.round(o.x + o.w / 2 - 5);
+    ctx.fillStyle = CACTUS_GREEN;
+    ctx.fillRect(tx + 2, o.y, 8, 2);              // rounded shoulders
+    ctx.fillRect(tx, o.y + 2, 10, o.h - 2);       // trunk
+    if (o.w >= 25) {
+      const laX = o.x + 2, laY = o.y + Math.round(o.h * 0.38), laH = Math.round(o.h * 0.2);
+      ctx.fillRect(laX + 4, laY, tx - laX - 4, 4);  // joint to trunk
+      ctx.fillRect(laX, laY - laH, 4, laH + 4);     // arm up
+      ctx.fillRect(laX + 1, laY - laH - 2, 2, 2);   // tapered tip
+      const raX = o.x + o.w - 6, raY = o.y + Math.round(o.h * 0.25), raH = Math.round(o.h * 0.18);
+      ctx.fillRect(tx + 10, raY, raX + 4 - tx - 10, 4);
+      ctx.fillRect(raX, raY - raH, 4, raH + 4);
+      ctx.fillRect(raX + 1, raY - raH - 2, 2, 2);
+    }
+    ctx.fillStyle = CACTUS_LIGHT;
+    ctx.fillRect(tx + 2, o.y + 4, 2, o.h - 6);    // left highlight
+    ctx.fillStyle = CACTUS_DARK;
+    ctx.fillRect(tx + 8, o.y + 4, 2, o.h - 4);    // right shade
+    ctx.fillRect(tx + 4, o.y + 10, 1, 1);         // spine dots
+    ctx.fillRect(tx + 6, o.y + 18, 1, 1);
+    ctx.fillRect(tx + 3, o.y + 26, 1, 1);
+  } else {
+    const p = (dx, dy, w, h) => ctx.fillRect(o.x + dx, o.y + dy, w, h);
+    ctx.fillStyle = INK;
+    p(0, 8, 8, 3);         // tail feathers
+    p(0, 12, 6, 3);
+    p(6, 7, 24, 10);       // body
+    p(10, 5, 16, 2);       // back
+    p(10, 17, 14, 2);      // rump
+    p(28, 4, 10, 8);       // head
+    p(38, 6, 8, 3);        // upper beak
+    p(38, 9, 6, 2);        // lower beak
+    ctx.fillStyle = INK_LIGHT;
+    p(24, 11, 6, 5);       // chest
+    ctx.fillStyle = "#fff";
+    p(31, 5, 4, 4);        // eye
+    ctx.fillStyle = INK_DARK;
+    p(33, 6, 2, 2);        // pupil
+    const flap = Math.floor(performance.now() / 130) % 3;
+    ctx.fillStyle = INK_DARK;
+    if (flap === 0) p(14, 0, 12, 6);       // wing up
+    else if (flap === 1) p(14, 8, 14, 5);  // wing mid
+    else p(14, 16, 12, 6);                 // wing down
+  }
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Ground + scrolling texture
+  ctx.fillStyle = "#9e9e9e";
+  ctx.fillRect(0, GROUND_Y, W, 2);
+  ctx.fillStyle = "#c9c9c9";
+  const toff = Math.floor(game.playTime * game.speed) % 30;
+  for (let gx = -toff; gx < W; gx += 30) {
+    ctx.fillRect(gx, GROUND_Y + 7, 10, 2);
+    ctx.fillRect(gx + 16, GROUND_Y + 13, 5, 2);
+  }
+
+  for (const o of game.obstacles) drawObstacle(o);
+  if (game.mode !== "start") drawDino();
+
+  // Score
+  ctx.fillStyle = "#9e9e9e";
+  ctx.font = "12px monospace";
+  ctx.textAlign = "right";
+  const s = String(Math.floor(game.score)).padStart(5, "0");
+  const hi = String(highScore).padStart(5, "0");
+  ctx.fillText("HI " + hi + "  " + s, W - 10, 18);
+
+  // Overlays
+  ctx.textAlign = "center";
+  if (game.mode === "start") {
+    ctx.fillStyle = INK;
+    ctx.font = "16px monospace";
+    ctx.fillText("DINO RUN WITH LAYA", W / 2, 58);
+    ctx.font = "12px monospace";
+    ctx.fillStyle = "#9e9e9e";
+    ctx.fillText("Press Space to start", W / 2, 82);
+  } else if (game.mode === "over") {
+    ctx.fillStyle = INK;
+    ctx.font = "16px monospace";
+    ctx.fillText("G A M E   O V E R", W / 2, 60);
+    ctx.font = "12px monospace";
+    ctx.fillStyle = "#9e9e9e";
+    ctx.fillText("Press Space to restart", W / 2, 84);
+  }
+  ctx.textAlign = "left";
+}
+
+// ---------------------------------------------------------------------------
+// Debug panel
+// ---------------------------------------------------------------------------
+const dbgStatus = document.getElementById("dbgStatus");
+const dbgLatency = document.getElementById("dbgLatency");
+const dbgSnapshot = document.getElementById("dbgSnapshot");
+const dbgResponse = document.getElementById("dbgResponse");
+const dbgApplied = document.getElementById("dbgApplied");
+const dbgHistory = document.getElementById("dbgHistory");
+
+function updateDebug() {
+  const statusLine = AI.lastError
+    ? AI.status + " — error: " + AI.lastError
+    : AI.status;
+  dbgStatus.textContent = statusLine;
+  dbgStatus.className = AI.lastError ? "err" : "";
+  dbgLatency.textContent =
+    "last: " + (AI.latencies.length ? Math.round(AI.latencies[AI.latencies.length - 1]) + " ms" : "—") +
+    "\navg(5): " + (AI.latencies.length ? Math.round(avgLatency()) + " ms" : "—");
+  dbgSnapshot.textContent = AI.lastSnapshot ? JSON.stringify(AI.lastSnapshot, null, 2) : "—";
+  dbgResponse.textContent = AI.lastResponse ? JSON.stringify(AI.lastResponse, null, 2) : "—";
+  const last = AI.history[0];
+  dbgApplied.textContent = last
+    ? "action: " + last.action + "\nsource: " + last.source + "\nreason: " + last.reason
+    : "—";
+  dbgHistory.textContent = AI.history.length
+    ? AI.history.map((h, i) => (i + 1) + ". [" + h.time + "] " + h.action + " (" + h.source + ")\n   " + h.reason).join("\n")
+    : "—";
+  sourceEl.textContent = AI.source;
+  latencyEl.textContent = AI.latencies.length ? "latency avg(5): " + Math.round(avgLatency()) + " ms" : "";
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space" || e.code === "ArrowUp" || e.code === "ArrowDown") e.preventDefault();
+  if (e.repeat) return;
+  if (e.code === "Space" || e.code === "ArrowUp") {
+    if (game.mode === "playing") doJump();
+    else resetGame();
+  } else if (e.code === "ArrowDown") {
+    duckHeld = true;
+  }
+});
+document.addEventListener("keyup", (e) => {
+  if (e.code === "ArrowDown") duckHeld = false;
+});
+canvas.addEventListener("click", () => {
+  if (game.mode !== "playing") resetGame();
+});
+modeSelect.addEventListener("change", () => {
+  AI.requestId++;       // invalidate any in-flight response
+  AI.busy = false;
+  AI.pending = null;
+  AI.duckHold = false;
+  AI.source = "idle";
+  AI.status = "idle";
+  AI.lastLocalAction = "";
+  updateDebug();
+});
+
+// ---------------------------------------------------------------------------
+// Main loop (delta-time)
+// ---------------------------------------------------------------------------
+let lastFrame = performance.now();
+function frame(nowMs) {
+  const dt = Math.min((nowMs - lastFrame) / 1000, 0.05);
+  lastFrame = nowMs;
+  if (game.mode === "playing") update(dt, nowMs);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
